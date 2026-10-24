@@ -4,15 +4,15 @@ plugins {
 
 android {
     namespace 'com.tencent.rvmncnn'
-    compileSdk 33
+    compileSdk 34
     ndkVersion "30.0.16248370"
 
     defaultConfig {
         applicationId "com.tencent.rvmncnn"
-        archivesBaseName = "$applicationId"
+        archivesBaseName = "flipcam"
 
-        minSdkVersion 21
-        targetSdkVersion 35
+        minSdkVersion 28
+        targetSdkVersion 34
 
         externalNativeBuild {
             cmake {
@@ -29,7 +29,7 @@ android {
     }
 
     dependencies {
-        implementation 'com.android.support:support-v4:24.0.0'
+        implementation 'androidx.appcompat:appcompat:1.6.1'
     }
 
     packaging {

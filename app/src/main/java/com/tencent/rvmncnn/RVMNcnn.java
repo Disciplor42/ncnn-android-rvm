@@ -24,6 +24,9 @@ public class RVMNcnn
     public native boolean switchCamera();
     public native boolean closeCamera();
     public native boolean setOutputWindow(Surface surface);
+    public native boolean setEncoderWindow(Surface surface);
+    public native float getCurrentFps();
+    public native float runBenchmark(AssetManager mgr, int modelid, int targetSize, int numFrames);
     public native boolean setCameraActive(boolean active);
     public native boolean setCameraPermission(boolean granted);
 
