@@ -12,70 +12,6 @@
 // CONDITIONS OF ANY KIND, either express or implied. See the License for the
 // specific language governing permissions and limitations under the License.
 
-// ncnn model exported from https://github.com/PeterL1n/RobustVideoMatting
-//
-// import torch
-// from torch import nn
-// from model import MattingNetwork
-// from model.fast_guided_filter import FastGuidedFilterRefiner
-// from model.deep_guided_filter import DeepGuidedFilterRefiner
-//
-// class Model(nn.Module):
-//     def __init__(self):
-//         super().__init__()
-//
-//         self.rvm = MattingNetwork('mobilenetv3').eval()
-//         self.rvm.load_state_dict(torch.load('rvm_mobilenetv3.pth'))
-//
-//         self.refiner_deep = DeepGuidedFilterRefiner()
-//         self.refiner_fast = FastGuidedFilterRefiner()
-//
-//     def forward_first_frame(self, src):
-//         return self.rvm(src)
-//
-//     def forward(self, src, src_sm, r1, r2, r3, r4):
-//
-//         f1, f2, f3, f4 = self.rvm.backbone(src_sm)
-//         f4 = self.rvm.aspp(f4)
-//         hid, *rec = self.rvm.decoder(src_sm, f1, f2, f3, f4, r1, r2, r3, r4)
-//
-//         # downsample
-//         fgr_residual, pha = self.rvm.project_mat(hid).split([3, 1], dim=-3)
-//         fgr = fgr_residual + src_sm
-//
-//         # downsample + refiner_deep
-//         fgr_residual_deep, pha_deep = self.refiner_deep(src, src_sm, fgr_residual, pha, hid)
-//         fgr_deep = fgr_residual_deep + src
-//
-//         # downsample + refiner_fast
-//         fgr_residual_fast, pha_fast = self.refiner_fast(src, src_sm, fgr_residual, pha, hid)
-//         fgr_fast = fgr_residual_fast + src
-//
-//         # downsample + segmentation
-//         seg = self.rvm.project_seg(hid)
-//
-//         return fgr, pha, fgr_deep, pha_deep, fgr_fast, pha_fast, seg, *rec
-//
-// import pnnx
-//
-// model = Model().eval()
-//
-// x = torch.rand(1, 3, 512, 512)
-// x2 = torch.rand(1, 3, 256, 256)
-// x2_hr = torch.rand(1, 3, 1024, 1024)
-//
-// # generate feats via forward_first_frame, with different shapes
-// fgr, pha, r1, r2, r3, r4 = model.forward_first_frame(x)
-// fgr2, pha2, r12, r22, r32, r42 = model.forward_first_frame(x2)
-//
-// # export with dynamic shape
-// pnnx.export(model, "rvm_mobilenetv3.pt", (x, x, r1, r2, r3, r4), (x2_hr, x2, r12, r22, r32, r42))
-//
-// and then fix refiner_fast fp16 overflow issue in ncnn.param via appending 31=1 layer feat mask
-//
-// BinaryOp   div_58    2 1 401 399 402 0=3 31=1
-//
-
 #include "rvm.h"
 
 #include "net.h"
@@ -83,6 +19,7 @@
 #include <opencv2/core/core.hpp>
 #include <opencv2/highgui/highgui.hpp>
 #include <opencv2/imgproc/imgproc.hpp>
+#include <cmath>
 
 RVM::RVM()
 {
@@ -92,17 +29,28 @@ RVM::RVM()
     segmentation = false;
     refine_deep = true;
     refine_fast = false;
+
+    // Precompute gamma lookup table: pow(v / 255.0, 0.9) * 255.0
+    for (int i = 0; i < 256; i++)
+    {
+        double v = i / 255.0;
+        double g = std::pow(v, 0.9);
+        gamma_lut[i] = cv::saturate_cast<uchar>(g * 255.0 + 0.5);
+    }
 }
 
 RVM::~RVM()
 {
 }
 
+void RVM::reset_temporal_state()
+{
+    prev_pha.release();
+}
+
 int RVM::load(const char* parampath, const char* modelpath, bool use_gpu)
 {
     rvm.clear();
-
-    // rvm.opt = ncnn::Option();
 
     rvm.opt.use_fp16_packed = false;
     rvm.opt.use_fp16_storage = false;
@@ -115,14 +63,13 @@ int RVM::load(const char* parampath, const char* modelpath, bool use_gpu)
     rvm.load_param(parampath);
     rvm.load_model(modelpath);
 
+    reset_temporal_state();
     return 0;
 }
 
 int RVM::load(AAssetManager* mgr, const char* parampath, const char* modelpath, bool use_gpu)
 {
     rvm.clear();
-
-    // rvm.opt = ncnn::Option();
 
     rvm.opt.use_fp16_packed = false;
     rvm.opt.use_fp16_storage = false;
@@ -135,6 +82,7 @@ int RVM::load(AAssetManager* mgr, const char* parampath, const char* modelpath, 
     rvm.load_param(mgr, parampath);
     rvm.load_model(mgr, modelpath);
 
+    reset_temporal_state();
     return 0;
 }
 
@@ -166,9 +114,6 @@ int RVM::detect(const cv::Mat& rgb, InterFeatures& feats, cv::Mat& fgr, cv::Mat&
     const int h = rgb.rows;
 
     const int max_stride = 16;
-
-    bool refine_deep = true;
-    // bool refine_fast = true;
 
     const float norm_vals[3] = {1 / 255.f, 1 / 255.f, 1 / 255.f};
 
@@ -354,14 +299,69 @@ int RVM::detect(const cv::Mat& rgb, InterFeatures& feats, cv::Mat& fgr, cv::Mat&
     return 0;
 }
 
+// Alpha post-processing pipeline:
+// 1. EMA temporal smoothing: alpha = 0.7 * alpha_prev + 0.3 * alpha_curr
+// 2. Gaussian blur (1px kernel/sigma ~0.5)
+// 3. Morphological close (2px kernel)
+// 4. Erode (1px kernel)
+// 5. Gamma correction: pow(alpha, 0.9) via LUT
+int RVM::postprocess_alpha(cv::Mat& pha)
+{
+    if (pha.empty()) return 0;
+
+    // 1. EMA temporal smoothing
+    if (!prev_pha.empty() && prev_pha.size() == pha.size())
+    {
+        // alpha_curr = 0.7 * prev + 0.3 * curr
+        cv::addWeighted(prev_pha, 0.7, pha, 0.3, 0, pha);
+    }
+    pha.copyTo(prev_pha);
+
+    // 2. Gaussian blur (3x3 kernel softens edges)
+    cv::GaussianBlur(pha, pha, cv::Size(3, 3), 0.5);
+
+    // 3. Morphological close (5x5 kernel fills tiny holes)
+    static cv::Mat close_kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(5, 5));
+    cv::morphologyEx(pha, pha, cv::MORPH_CLOSE, close_kernel);
+
+    // 4. Erode (3x3 kernel removes dark halo)
+    static cv::Mat erode_kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(3, 3));
+    cv::erode(pha, pha, erode_kernel);
+
+    // 5. Gamma correction via precomputed LUT: pow(val / 255.0, 0.9)
+    int rows = pha.rows;
+    int cols = pha.cols;
+    if (pha.isContinuous())
+    {
+        cols *= rows;
+        rows = 1;
+    }
+
+    for (int y = 0; y < rows; y++)
+    {
+        uchar* p = pha.ptr<uchar>(y);
+        for (int x = 0; x < cols; x++)
+        {
+            p[x] = gamma_lut[p[x]];
+        }
+    }
+
+    return 0;
+}
+
 int RVM::draw(cv::Mat& rgb, const cv::Mat& fgr, const cv::Mat& pha, const cv::Mat& seg)
+{
+    return draw_magenta(rgb, fgr, pha);
+}
+
+// Composites foreground person onto solid magenta background (#FF00FF: R=255, G=0, B=255)
+int RVM::draw_magenta(cv::Mat& rgb, const cv::Mat& fgr, const cv::Mat& pha)
 {
     const int w = rgb.cols;
     const int h = rgb.rows;
 
     if (!fgr.empty() && !pha.empty())
     {
-        // composite
         for (int y = 0; y < h; y++)
         {
             const uchar* pf = fgr.ptr<const uchar>(y);
@@ -370,29 +370,12 @@ int RVM::draw(cv::Mat& rgb, const cv::Mat& fgr, const cv::Mat& pha, const cv::Ma
             for (int x = 0; x < w; x++)
             {
                 const float alpha = pa[0] / 255.f;
-                p[0] = cv::saturate_cast<uchar>(pf[0] * alpha + (1 - alpha) * 120);
-                p[1] = cv::saturate_cast<uchar>(pf[1] * alpha + (1 - alpha) * 255);
-                p[2] = cv::saturate_cast<uchar>(pf[2] * alpha + (1 - alpha) * 155);
+                // Magenta background: RGB = (255, 0, 255)
+                p[0] = cv::saturate_cast<uchar>(pf[0] * alpha + (1.0f - alpha) * 255.0f); // R
+                p[1] = cv::saturate_cast<uchar>(pf[1] * alpha + (1.0f - alpha) * 0.0f);   // G
+                p[2] = cv::saturate_cast<uchar>(pf[2] * alpha + (1.0f - alpha) * 255.0f); // B
                 pf += 3;
                 pa += 1;
-                p += 3;
-            }
-        }
-    }
-    else if (!seg.empty())
-    {
-        // composite seg
-        for (int y = 0; y < h; y++)
-        {
-            uchar* p = rgb.ptr<uchar>(y);
-            const uchar* ps = seg.ptr<const uchar>(y);
-            for (int x = 0; x < w; x++)
-            {
-                const float alpha = ps[0] / 255.f;
-                p[0] = cv::saturate_cast<uchar>(p[0] * alpha + (1 - alpha) * 120);
-                p[1] = cv::saturate_cast<uchar>(p[1] * alpha + (1 - alpha) * 255);
-                p[2] = cv::saturate_cast<uchar>(p[2] * alpha + (1 - alpha) * 155);
-                ps += 1;
                 p += 3;
             }
         }

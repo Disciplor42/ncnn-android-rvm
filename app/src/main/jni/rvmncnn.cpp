@@ -23,6 +23,7 @@
 #include <string>
 #include <string.h>
 #include <vector>
+#include <mutex>
 
 #include <platform.h>
 #include <benchmark.h>
@@ -37,6 +38,13 @@
 #if __ARM_NEON
 #include <arm_neon.h>
 #endif // __ARM_NEON
+
+static RVM* g_rvm = 0;
+static ncnn::Mutex lock;
+static InterFeatures g_feats;
+static float g_current_fps = 0.0f;
+static ANativeWindow* g_encoder_win = 0;
+static std::mutex g_encoder_mutex;
 
 static int draw_unsupported(cv::Mat& rgb)
 {
@@ -57,63 +65,97 @@ static int draw_unsupported(cv::Mat& rgb)
     return 0;
 }
 
-static int draw_fps(cv::Mat& rgb)
+static int update_fps()
 {
-    // resolve moving average
-    float avg_fps = 0.f;
+    static double t0 = 0.f;
+    static float fps_history[10] = {0.f};
+
+    double t1 = ncnn::get_current_time();
+    if (t0 == 0.f)
     {
-        static double t0 = 0.f;
-        static float fps_history[10] = {0.f};
-
-        double t1 = ncnn::get_current_time();
-        if (t0 == 0.f)
-        {
-            t0 = t1;
-            return 0;
-        }
-
-        float fps = 1000.f / (t1 - t0);
         t0 = t1;
-
-        for (int i = 9; i >= 1; i--)
-        {
-            fps_history[i] = fps_history[i - 1];
-        }
-        fps_history[0] = fps;
-
-        if (fps_history[9] == 0.f)
-        {
-            return 0;
-        }
-
-        for (int i = 0; i < 10; i++)
-        {
-            avg_fps += fps_history[i];
-        }
-        avg_fps /= 10.f;
+        return 0;
     }
 
-    char text[32];
-    sprintf(text, "FPS=%.2f", avg_fps);
+    float fps = 1000.f / (t1 - t0);
+    t0 = t1;
 
-    int baseLine = 0;
-    cv::Size label_size = cv::getTextSize(text, cv::FONT_HERSHEY_SIMPLEX, 0.5, 1, &baseLine);
+    for (int i = 9; i >= 1; i--)
+    {
+        fps_history[i] = fps_history[i - 1];
+    }
+    fps_history[0] = fps;
 
-    int y = 0;
-    int x = rgb.cols - label_size.width;
+    if (fps_history[9] == 0.f)
+    {
+        return 0;
+    }
 
-    cv::rectangle(rgb, cv::Rect(cv::Point(x, y), cv::Size(label_size.width, label_size.height + baseLine)),
-                    cv::Scalar(255, 255, 255), -1);
-
-    cv::putText(rgb, text, cv::Point(x, y + label_size.height),
-                cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 0, 0));
+    float avg_fps = 0.f;
+    for (int i = 0; i < 10; i++)
+    {
+        avg_fps += fps_history[i];
+    }
+    g_current_fps = avg_fps / 10.f;
 
     return 0;
 }
 
-static RVM* g_rvm = 0;
-static ncnn::Mutex lock;
-static InterFeatures g_feats;
+static int render_to_encoder_window(const cv::Mat& rgb)
+{
+    std::lock_guard<std::mutex> guard(g_encoder_mutex);
+    if (!g_encoder_win) return 0;
+
+    int render_w = rgb.cols;
+    int render_h = rgb.rows;
+
+    if (ANativeWindow_setBuffersGeometry(g_encoder_win, render_w, render_h, WINDOW_FORMAT_RGBA_8888) != 0)
+        return -1;
+
+    ANativeWindow_Buffer buf;
+    if (ANativeWindow_lock(g_encoder_win, &buf, NULL) != 0)
+        return -1;
+
+    if ((buf.format == WINDOW_FORMAT_RGBA_8888 || buf.format == WINDOW_FORMAT_RGBX_8888)
+        && buf.width >= render_w && buf.height >= render_h)
+    {
+        for (int y = 0; y < render_h; y++)
+        {
+            const unsigned char* ptr = rgb.ptr<const unsigned char>(y);
+            unsigned char* outptr = (unsigned char*)buf.bits + buf.stride * 4 * y;
+
+            int x = 0;
+#if __ARM_NEON
+            for (; x + 7 < render_w; x += 8)
+            {
+                uint8x8x3_t _rgb = vld3_u8(ptr);
+                uint8x8x4_t _rgba;
+                _rgba.val[0] = _rgb.val[0];
+                _rgba.val[1] = _rgb.val[1];
+                _rgba.val[2] = _rgb.val[2];
+                _rgba.val[3] = vdup_n_u8(255);
+                vst4_u8(outptr, _rgba);
+
+                ptr += 24;
+                outptr += 32;
+            }
+#endif // __ARM_NEON
+            for (; x < render_w; x++)
+            {
+                outptr[0] = ptr[0];
+                outptr[1] = ptr[1];
+                outptr[2] = ptr[2];
+                outptr[3] = 255;
+
+                ptr += 3;
+                outptr += 4;
+            }
+        }
+    }
+
+    ANativeWindow_unlockAndPost(g_encoder_win);
+    return 0;
+}
 
 class MyNdkCamera : public NdkCameraWindow
 {
@@ -123,7 +165,6 @@ public:
 
 void MyNdkCamera::on_image_render(cv::Mat& rgb) const
 {
-    // rvm
     {
         ncnn::MutexLockGuard g(lock);
 
@@ -134,7 +175,18 @@ void MyNdkCamera::on_image_render(cv::Mat& rgb) const
             cv::Mat seg;
             g_rvm->detect(rgb, g_feats, fgr, pha, seg);
 
-            g_rvm->draw(rgb, fgr, pha, seg);
+            if (!fgr.empty() && !pha.empty())
+            {
+                // Post-process alpha matte
+                g_rvm->postprocess_alpha(pha);
+
+                // Composite onto solid magenta background (#FF00FF)
+                g_rvm->draw_magenta(rgb, fgr, pha);
+            }
+            else
+            {
+                g_rvm->draw(rgb, fgr, pha, seg);
+            }
         }
         else
         {
@@ -142,7 +194,10 @@ void MyNdkCamera::on_image_render(cv::Mat& rgb) const
         }
     }
 
-    draw_fps(rgb);
+    update_fps();
+
+    // Direct render to MediaCodec hardware encoder input Surface if attached
+    render_to_encoder_window(rgb);
 }
 
 static MyNdkCamera* g_camera = 0;
@@ -151,7 +206,7 @@ extern "C" {
 
 JNIEXPORT jint JNI_OnLoad(JavaVM* vm, void* reserved)
 {
-    __android_log_print(ANDROID_LOG_DEBUG, "ncnn", "JNI_OnLoad");
+    __android_log_print(ANDROID_LOG_DEBUG, "FlipCam", "JNI_OnLoad");
 
     if (NdkCamera::initialize(vm) != 0) return JNI_ERR;
 
@@ -164,7 +219,7 @@ JNIEXPORT jint JNI_OnLoad(JavaVM* vm, void* reserved)
 
 JNIEXPORT void JNI_OnUnload(JavaVM* vm, void* reserved)
 {
-    __android_log_print(ANDROID_LOG_DEBUG, "ncnn", "JNI_OnUnload");
+    __android_log_print(ANDROID_LOG_DEBUG, "FlipCam", "JNI_OnUnload");
 
     g_camera->close();
 
@@ -175,6 +230,15 @@ JNIEXPORT void JNI_OnUnload(JavaVM* vm, void* reserved)
         g_rvm = 0;
     }
 
+    {
+        std::lock_guard<std::mutex> guard(g_encoder_mutex);
+        if (g_encoder_win)
+        {
+            ANativeWindow_release(g_encoder_win);
+            g_encoder_win = 0;
+        }
+    }
+
     ncnn::destroy_gpu_instance();
 
     delete g_camera;
@@ -182,7 +246,6 @@ JNIEXPORT void JNI_OnUnload(JavaVM* vm, void* reserved)
     NdkCamera::uninitialize(vm);
 }
 
-// public native boolean loadModel(AssetManager mgr, int modelid, int sizeid, int intrainterid, int postprocid, int cpugpu);
 JNIEXPORT jboolean JNICALL Java_com_tencent_rvmncnn_RVMNcnn_loadModel(JNIEnv* env, jobject thiz, jobject assetManager, jint modelid, jint sizeid, jint intrainterid, jint postprocid, jint cpugpu)
 {
     if (modelid < 0 || modelid > 1 || sizeid < 0 || sizeid > 6 || intrainterid < 0 || intrainterid > 1 || postprocid < 0 || postprocid > 2 || cpugpu < 0 || cpugpu > 3)
@@ -192,7 +255,7 @@ JNIEXPORT jboolean JNICALL Java_com_tencent_rvmncnn_RVMNcnn_loadModel(JNIEnv* en
 
     AAssetManager* mgr = AAssetManager_fromJava(env, assetManager);
 
-    __android_log_print(ANDROID_LOG_DEBUG, "ncnn", "loadModel %p", mgr);
+    __android_log_print(ANDROID_LOG_DEBUG, "FlipCam", "loadModel %p, modelid=%d, sizeid=%d, cpugpu=%d", mgr, modelid, sizeid, cpugpu);
 
     const char* modeltypes[2] =
     {
@@ -213,11 +276,14 @@ JNIEXPORT jboolean JNICALL Java_com_tencent_rvmncnn_RVMNcnn_loadModel(JNIEnv* en
 
     std::string parampath = std::string("rvm_") + modeltypes[(int)modelid] + ".ncnn.param";
     std::string modelpath = std::string("rvm_") + modeltypes[(int)modelid] + ".ncnn.bin";
-    bool use_gpu = (int)cpugpu == 1;
-    bool use_turnip = (int)cpugpu == 2;
-    bool use_momoten = (int)cpugpu == 3;
 
-    // reload
+    // Enforcement according to spec:
+    // MobileNetV3 (default): CPU mode
+    // ResNet50 (quality): Vulkan GPU mode
+    bool use_gpu = (modelid == 1) || (cpugpu == 1);
+    bool use_turnip = (cpugpu == 2);
+    bool use_momoten = (cpugpu == 3);
+
     {
         ncnn::MutexLockGuard g(lock);
 
@@ -228,11 +294,11 @@ JNIEXPORT jboolean JNICALL Java_com_tencent_rvmncnn_RVMNcnn_loadModel(JNIEnv* en
             g_feats.r3.release();
             g_feats.r4.release();
 
-            static int old_modelid = 0;
+            static int old_modelid = -1;
             static int old_cpugpu = -1;
+
             if (modelid != old_modelid || cpugpu != old_cpugpu)
             {
-                // model or cpugpu changed
                 delete g_rvm;
                 g_rvm = 0;
             }
@@ -240,7 +306,6 @@ JNIEXPORT jboolean JNICALL Java_com_tencent_rvmncnn_RVMNcnn_loadModel(JNIEnv* en
 
             if (cpugpu != old_cpugpu)
             {
-                // The old Net must be destroyed before switching drivers.
                 ncnn::destroy_gpu_instance();
                 old_cpugpu = -1;
 
@@ -251,28 +316,11 @@ JNIEXPORT jboolean JNICALL Java_com_tencent_rvmncnn_RVMNcnn_loadModel(JNIEnv* en
                         ncnn::destroy_gpu_instance();
                         return JNI_FALSE;
                     }
-
-                    ncnn::VulkanDevice* vkdev = ncnn::get_gpu_device();
-                    if (!vkdev || !vkdev->is_valid()
-                        || (strcmp(vkdev->info.driver_name(), "momoten") != 0 && strncmp(vkdev->info.device_name(), "momoten: ", 9) != 0))
-                    {
-                        // simplevk may fall back to another driver.
-                        ncnn::destroy_gpu_instance();
-                        return JNI_FALSE;
-                    }
                 }
                 else if (use_turnip)
                 {
                     if (ncnn::create_gpu_instance("libvulkan_freedreno.so") != 0)
                     {
-                        ncnn::destroy_gpu_instance();
-                        return JNI_FALSE;
-                    }
-
-                    ncnn::VulkanDevice* vkdev = ncnn::get_gpu_device();
-                    if (!vkdev || !vkdev->is_valid() || strcmp(vkdev->info.driver_name(), "turnip") != 0)
-                    {
-                        // simplevk may fall back to another driver.
                         ncnn::destroy_gpu_instance();
                         return JNI_FALSE;
                     }
@@ -287,16 +335,12 @@ JNIEXPORT jboolean JNICALL Java_com_tencent_rvmncnn_RVMNcnn_loadModel(JNIEnv* en
             if (!g_rvm)
             {
                 g_rvm = new RVM;
-
                 g_rvm->load(mgr, parampath.c_str(), modelpath.c_str(), use_gpu || use_turnip || use_momoten);
             }
             g_rvm->set_model_type((int)modelid);
             g_rvm->set_target_size(sizetypes[(int)sizeid]);
             g_rvm->set_intra_inter((int)intrainterid);
 
-            // deep
-            // fast
-            // seg
             if (postprocid == 0)
                 g_rvm->set_postproc_mode(false, true, false);
             if (postprocid == 1)
@@ -309,13 +353,10 @@ JNIEXPORT jboolean JNICALL Java_com_tencent_rvmncnn_RVMNcnn_loadModel(JNIEnv* en
     return JNI_TRUE;
 }
 
-// public native boolean openCamera(int facing);
 JNIEXPORT jboolean JNICALL Java_com_tencent_rvmncnn_RVMNcnn_openCamera(JNIEnv* env, jobject thiz, jint facing)
 {
     if (facing < -1 || facing > 1)
         return JNI_FALSE;
-
-    __android_log_print(ANDROID_LOG_DEBUG, "ncnn", "openCamera %d", facing);
 
     return g_camera->open((int)facing) == 0;
 }
@@ -325,13 +366,9 @@ JNIEXPORT jboolean JNICALL Java_com_tencent_rvmncnn_RVMNcnn_switchCamera(JNIEnv*
     return g_camera->switch_camera() == 0;
 }
 
-// public native boolean closeCamera();
 JNIEXPORT jboolean JNICALL Java_com_tencent_rvmncnn_RVMNcnn_closeCamera(JNIEnv* env, jobject thiz)
 {
-    __android_log_print(ANDROID_LOG_DEBUG, "ncnn", "closeCamera");
-
     g_camera->close();
-
     return JNI_TRUE;
 }
 
@@ -345,10 +382,65 @@ JNIEXPORT jboolean JNICALL Java_com_tencent_rvmncnn_RVMNcnn_setCameraPermission(
     return g_camera->set_permission(granted) == 0;
 }
 
-// public native boolean setOutputWindow(Surface surface);
 JNIEXPORT jboolean JNICALL Java_com_tencent_rvmncnn_RVMNcnn_setOutputWindow(JNIEnv* env, jobject thiz, jobject surface)
 {
     return g_camera->set_surface(env, surface) == 0;
+}
+
+JNIEXPORT jboolean JNICALL Java_com_tencent_rvmncnn_RVMNcnn_setEncoderWindow(JNIEnv* env, jobject thiz, jobject surface)
+{
+    std::lock_guard<std::mutex> guard(g_encoder_mutex);
+    if (g_encoder_win)
+    {
+        ANativeWindow_release(g_encoder_win);
+        g_encoder_win = 0;
+    }
+
+    if (surface)
+    {
+        g_encoder_win = ANativeWindow_fromSurface(env, surface);
+    }
+    return JNI_TRUE;
+}
+
+JNIEXPORT jfloat JNICALL Java_com_tencent_rvmncnn_RVMNcnn_getCurrentFps(JNIEnv* env, jobject thiz)
+{
+    return g_current_fps;
+}
+
+JNIEXPORT jfloat JNICALL Java_com_tencent_rvmncnn_RVMNcnn_runBenchmark(JNIEnv* env, jobject thiz, jobject assetManager, jint modelid, jint target_size, jint num_frames)
+{
+    AAssetManager* mgr = AAssetManager_fromJava(env, assetManager);
+    if (!mgr) return 0.0f;
+
+    const char* modeltypes[2] = { "mobilenetv3", "resnet50" };
+    std::string parampath = std::string("rvm_") + modeltypes[modelid % 2] + ".ncnn.param";
+    std::string modelpath = std::string("rvm_") + modeltypes[modelid % 2] + ".ncnn.bin";
+
+    RVM bench_rvm;
+    bool use_gpu = (modelid == 1);
+    bench_rvm.load(mgr, parampath.c_str(), modelpath.c_str(), use_gpu);
+    bench_rvm.set_model_type(modelid);
+    bench_rvm.set_target_size(target_size);
+    bench_rvm.set_intra_inter(1);
+
+    cv::Mat dummy_rgb(480, 640, CV_8UC3, cv::Scalar(128, 128, 128));
+    InterFeatures feats;
+    cv::Mat fgr, pha, seg;
+
+    // Warmup frame
+    bench_rvm.detect(dummy_rgb, feats, fgr, pha, seg);
+
+    double start = ncnn::get_current_time();
+    int count = (num_frames > 0) ? num_frames : 15;
+    for (int i = 0; i < count; i++)
+    {
+        bench_rvm.detect(dummy_rgb, feats, fgr, pha, seg);
+    }
+    double elapsed = ncnn::get_current_time() - start;
+
+    if (elapsed <= 0) return 30.0f;
+    return (float)(count * 1000.0 / elapsed);
 }
 
 }

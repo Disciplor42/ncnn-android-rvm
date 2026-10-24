@@ -42,7 +42,11 @@ public:
     void set_postproc_mode(bool segmentation, bool refine_deep, bool refine_fast);
 
     int detect(const cv::Mat& rgb, InterFeatures& feats, cv::Mat& fgr, cv::Mat& pha, cv::Mat& seg);
+    int postprocess_alpha(cv::Mat& pha);
     int draw(cv::Mat& rgb, const cv::Mat& fgr, const cv::Mat& pha, const cv::Mat& seg);
+    int draw_magenta(cv::Mat& rgb, const cv::Mat& fgr, const cv::Mat& pha);
+
+    void reset_temporal_state();
 
 protected:
     ncnn::Net rvm;
@@ -52,6 +56,9 @@ protected:
     bool segmentation;
     bool refine_deep;
     bool refine_fast;
+
+    cv::Mat prev_pha;
+    unsigned char gamma_lut[256];
 };
 
 #endif // RVM_H

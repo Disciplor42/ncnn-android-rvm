@@ -1,22 +1,35 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
       android:versionCode="1"
-      android:versionName="1.1">
+      android:versionName="1.0">
     <uses-permission android:name="android.permission.CAMERA" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CAMERA" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
     <uses-feature android:name="android.hardware.camera" android:required="false" />
 
-    <application android:label="@string/app_name">
+    <application
+        android:label="FlipCam"
+        android:icon="@android:drawable/ic_menu_camera">
         <!-- Optional vendor OpenCL libraries used by momoten on Android 12+. -->
         <uses-native-library android:name="libOpenCL.so" android:required="false" />
         <uses-native-library android:name="libOpenCL-pixel.so" android:required="false" />
         <uses-native-library android:name="libGLES_mali.so" android:required="false" />
         <uses-native-library android:name="libmali.so" android:required="false" />
         <uses-native-library android:name="libPVROCL.so" android:required="false" />
-        <activity android:name="MainActivity" android:label="@string/app_name" android:exported="true">
+
+        <activity android:name=".MainActivity" android:label="FlipCam" android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <service
+            android:name=".StreamingService"
+            android:enabled="true"
+            android:exported="false"
+            android:foregroundServiceType="camera" />
     </application>
-</manifest> 
+</manifest>

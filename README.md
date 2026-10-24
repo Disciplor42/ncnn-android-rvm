@@ -1,62 +1,118 @@
-# ncnn-android-rvm
+# FlipCam — On-Phone AI Background Removal → Virtual Webcam on Linux
 
-![download](https://img.shields.io/github/downloads/nihui/ncnn-android-rvm/total.svg)
+FlipCam turns your Android smartphone into an AI-powered virtual webcam for Linux using USB ADB port forwarding. It performs on-device AI background removal with Robust Video Matting (RVM) and composites the user onto a magenta background, streaming low-latency H.264 video directly to a `/dev/video99` virtual camera device for OBS Studio.
 
-RVM
+---
 
-This is a sample ncnn android project, it depends on ncnn library and opencv
+## Requirements
 
-https://github.com/Tencent/ncnn
+### Phone (Android)
+- **Architecture:** `arm64-v8a`
+- **Operating System:** Android 9.0 (API 28) or newer
+- **RAM:** 4 GB minimum
+- **Connection:** USB Debugging enabled
 
-https://github.com/nihui/opencv-mobile
+### PC (Linux)
+- **Distribution:** Arch Linux, Fedora, or Debian/Ubuntu-based distros
+- **Packages:** `adb`, `v4l2loopback-dkms`, `python3-av` (installed automatically by `setup.sh`)
+- **Applications:** OBS Studio (or any application supporting V4L2 webcam inputs)
 
-https://github.com/nihui/mesa-turnip-android-driver  (mesa turnip driver)
+---
 
-https://github.com/nihui/momoten  (momoten driver)
+## Quick Start
 
-## android apk file download
-https://github.com/nihui/ncnn-android-rvm/releases/latest
+### Step 1: Install APK on Android Phone
+Build or download the `flipcam.apk` and install it on your phone:
+```bash
+adb install -r app/build/outputs/apk/debug/app-debug.apk
+```
 
-## how to build and run
-### step1
-https://github.com/Tencent/ncnn/releases
+### Step 2: Connect USB & Run Setup Script
+Connect your phone to your PC via USB (ensure USB Debugging is turned on) and run:
+```bash
+./setup.sh
+```
+This script automatically installs required packages, loads the `/dev/video99` v4l2loopback virtual camera module, configures `adb forward tcp:9000 tcp:9000`, and launches the Python receiver.
 
-* Download ncnn-YYYYMMDD-android-vulkan.zip or build ncnn for android yourself
-* Extract ncnn-YYYYMMDD-android-vulkan.zip into **app/src/main/jni** and change the **ncnn_DIR** path to yours in **app/src/main/jni/CMakeLists.txt**
+### Step 3: Configure OBS Studio
+1. Open OBS Studio.
+2. Open your Android app, select your preferred model (Fast / Quality) and resolution (Auto / 1080p / 720p / 540p), and tap **START STREAM**.
+3. In OBS, add a new **Video Capture Device (V4L2)** source and choose **FlipCam** (`/dev/video99`).
+4. Add a **Chroma Key** filter to the source with key color `#FF00FF` (Magenta).
 
-### step2
-https://github.com/nihui/opencv-mobile
+---
 
-* Download opencv-mobile-XYZ-android.zip
-* Extract opencv-mobile-XYZ-android.zip into **app/src/main/jni** and change the **OpenCV_DIR** path to yours in **app/src/main/jni/CMakeLists.txt**
+## OBS Configuration Steps
 
-### step3
-https://github.com/nihui/mesa-turnip-android-driver
+1. In the **Sources** panel, click **+** → **Video Capture Device (V4L2)**.
+2. Select `/dev/video99` (labelled **FlipCam**).
+3. Right-click the video source → **Filters**.
+4. Click **+** under Effect Filters → select **Chroma Key**.
+5. Set **Key Color Type** to **Custom**, and enter HTML Color Code `#FF00FF`.
+6. Adjust **Similarity** (approx. 0.15) and **Smoothness** (approx. 0.15) until background is completely transparent.
+7. Add your desired background image/video layer underneath the camera source in OBS.
 
-* Download mesa-turnip-android-XYZ.zip
-* Create directory **app/src/main/jniLibs/arm64-v8a** if not exists
-* Extract `libvulkan_freedreno.so` from mesa-turnip-android-XYZ.zip into **app/src/main/jniLibs/arm64-v8a**
+*(Placeholder: `![OBS Setup Screenshot](docs/obs_setup.png)`)*
 
-### step4
-https://github.com/nihui/momoten/releases/latest
+---
 
-* Download `momoten-YYYYMMDD-android-<target>.zip` for `arm64-v8a-api21`, `armeabi-v7a-api14`, `x86-api14` and `x86_64-api21`
-* Extract `lib/libmomoten.so` into `app/src/main/jniLibs/<abi>` for each corresponding ABI (create directories if needed)
-* Select **momoten** in the CPU/GPU selector; a usable vendor OpenCL driver is required
+## Build from Source
 
-### step5
-* Open this project with Android Studio, build it and enjoy!
+### Prerequisites
+- **Android Studio** (2023.1+)
+- **Android NDK** (`r26b` or `r27` / NDK `30.0.16248370`)
+- **CMake** (`3.22.1` or newer)
 
-## some notes
-* Android 5.0 (API 21) or newer is required
-* NDK Camera is preferred, with Camera1 used on older Android versions and legacy devices
-* All models are manually modified to accept dynamic input shape
-* Most small models run slower on GPU than on CPU, this is common
-* FPS may be lower in dark environment because of longer camera exposure time
+### Build Steps
+1. Clone the repository:
+   ```bash
+   git clone https://github.com/nihui/ncnn-android-rvm.git
+   cd ncnn-android-rvm
+   ```
+2. Download pre-built ncnn and opencv-mobile libraries into `app/src/main/jni` as described in `app/src/main/jni/CMakeLists.txt`.
+3. Build APK using Gradle:
+   ```bash
+   ./gradlew assembleDebug
+   ```
 
-## screenshot
-![](screenshot0.jpg)
+---
 
-## guidelines for converting RVM models
+## Troubleshooting
 
-TBA
+### "adb: command not found"
+- Install Android platform-tools via your package manager (`sudo apt install adb`, `sudo dnf install android-tools`, or `sudo pacman -S android-tools`).
+
+### "v4l2loopback not found" or "Failed to create /dev/video99"
+- Ensure Linux kernel headers and DKMS are installed for your running kernel.
+- Run `sudo modprobe v4l2loopback devices=1 video_nr=99 card_label="FlipCam" exclusive_caps=1`.
+
+### "No frames received"
+- Verify ADB detects your phone: `adb devices`.
+- Check ADB port forwarding is active: `adb forward --list`. Re-run `adb forward tcp:9000 tcp:9000`.
+- Ensure you tapped **START STREAM** inside the phone app.
+
+### "Low FPS / Laggy Video"
+- Switch Model selection from **Quality (ResNet50)** to **Fast (MobileNetV3)** in the app UI.
+- Lower the resolution selection to **720p** or **540p**.
+
+---
+
+## FAQ
+
+### Why magenta (#FF00FF)?
+Magenta is rarely present in clothing, skin tones, or room environments, making it an ideal chroma key target that prevents accidental cutout transparency.
+
+### Why not green?
+Green frequently appears in plants, clothing, background elements, and eye colors, leading to unwanted keying artifacts.
+
+### Can I use this without OBS?
+Yes! Any Linux application that reads V4L2 webcam devices (such as Zoom, Google Meet, Discord, or WebRTC browsers) can select `/dev/video99`.
+
+### Why USB only?
+USB ADB port forwarding guarantees deterministic ultra-low latency (< 120ms) and avoids packet loss or congestion caused by Wi-Fi networks.
+
+---
+
+## License
+
+This project is licensed under the [MIT License](LICENSE).
